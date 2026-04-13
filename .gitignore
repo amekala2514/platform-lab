@@ -1,0 +1,28 @@
+# Terraform
+**/.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# Go
+go-services/**/vendor/
+go-services/**/*.test
+
+# Docker
+*.tar
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# kind cluster info (generated)
+terraform/environments/local/cluster-info.txt

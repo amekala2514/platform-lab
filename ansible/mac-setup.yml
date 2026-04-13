@@ -1,0 +1,124 @@
+---
+- name: Mac Studio - platform-lab bootstrap
+  hosts: local
+  gather_facts: true
+
+  vars:
+    homebrew_packages:
+      - terraform
+      - kubectl
+      - kind
+      - go
+      - ansible   # idempotent — already installed but good to track here
+    project_dirs:
+      - "{{ ansible_env.HOME }}/platform-lab"
+      - "{{ ansible_env.HOME }}/platform-lab/go-services"
+      - "{{ ansible_env.HOME }}/platform-lab/k8s"
+      - "{{ ansible_env.HOME }}/platform-lab/terraform"
+      - "{{ ansible_env.HOME }}/platform-lab/ansible"
+      - "{{ ansible_env.HOME }}/platform-lab/scripts"
+      - "{{ ansible_env.HOME }}/platform-lab/docs"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1. Verify Xcode CLT
+    # ------------------------------------------------------------------
+    - name: Check Xcode Command Line Tools
+      command: xcode-select -p
+      register: xcode_check
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if Xcode CLT not installed
+      debug:
+        msg: "Xcode CLT not found — run: xcode-select --install"
+      when: xcode_check.rc != 0
+
+    # ------------------------------------------------------------------
+    # 2. Verify Homebrew is present
+    # ------------------------------------------------------------------
+    - name: Check Homebrew
+      command: brew --version
+      register: brew_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if Homebrew is missing
+      fail:
+        msg: "Homebrew not found. Install it from https://brew.sh and re-run this playbook."
+      when: brew_check.rc != 0
+
+    # ------------------------------------------------------------------
+    # 3. Install Homebrew packages
+    # ------------------------------------------------------------------
+    - name: Install Homebrew packages
+      community.general.homebrew:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ homebrew_packages }}"
+
+    # ------------------------------------------------------------------
+    # 4. Tap HashiCorp for Terraform (ensures official build)
+    # ------------------------------------------------------------------
+    - name: Tap HashiCorp Homebrew repository
+      community.general.homebrew_tap:
+        name: hashicorp/tap
+        state: present
+
+    - name: Install Terraform from HashiCorp tap
+      community.general.homebrew:
+        name: hashicorp/tap/terraform
+        state: present
+
+    # ------------------------------------------------------------------
+    # 5. Create project directories
+    # ------------------------------------------------------------------
+    - name: Ensure project directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ project_dirs }}"
+
+    # ------------------------------------------------------------------
+    # 6. Verify tool versions
+    # ------------------------------------------------------------------
+    - name: Gather tool versions
+      command: "{{ item.cmd }}"
+      register: version_results
+      changed_when: false
+      loop:
+        - { name: terraform,  cmd: "terraform --version" }
+        - { name: kubectl,    cmd: "kubectl version --client" }
+        - { name: kind,       cmd: "kind version" }
+        - { name: go,         cmd: "go version" }
+        - { name: docker,     cmd: "docker --version" }
+        - { name: ansible,    cmd: "ansible --version" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Print tool versions
+      debug:
+        msg: "{{ item.stdout_lines[0] }}"
+      loop: "{{ version_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # ------------------------------------------------------------------
+    # 7. Shell profile PATH check (Apple Silicon)
+    # ------------------------------------------------------------------
+    - name: Check that /opt/homebrew/bin is in PATH
+      command: "grep -q '/opt/homebrew/bin' {{ ansible_env.HOME }}/.zprofile || grep -q '/opt/homebrew/bin' {{ ansible_env.HOME }}/.zshrc"
+      register: path_check
+      changed_when: false
+      failed_when: false
+      when: ansible_architecture == "arm64"
+
+    - name: Warn if Homebrew PATH missing from shell profile
+      debug:
+        msg: >
+          /opt/homebrew/bin not found in ~/.zprofile or ~/.zshrc.
+          Add this line: export PATH="/opt/homebrew/bin:$PATH"
+      when:
+        - ansible_architecture == "arm64"
+        - path_check.rc != 0
