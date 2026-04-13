@@ -2,6 +2,8 @@
 **/.terraform/
 terraform.tfstate
 terraform.tfstate.backup
+**/terraform.tfstate
+**/terraform.tfstate.backup
 *.tfvars
 !*.tfvars.example
 .terraform.lock.hcl
@@ -9,6 +11,7 @@ terraform.tfstate.backup
 # Go
 go-services/**/vendor/
 go-services/**/*.test
+go-services/**/platform-api
 
 # Docker
 *.tar

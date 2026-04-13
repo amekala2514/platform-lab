@@ -27,9 +27,10 @@ docker build -t "$IMAGE_NAME:$IMAGE_TAG" "$SERVICE_DIR"
 log "Loading image into kind cluster '$CLUSTER'..."
 kind load docker-image "$IMAGE_NAME:$IMAGE_TAG" --name "$CLUSTER"
 
-# 4. Apply Kubernetes manifests
+# 4. Apply Kubernetes manifests (Deployment + Service, then Ingress)
 log "Applying Kubernetes manifests..."
 kubectl apply -f "$K8S_MANIFEST" --context "kind-$CLUSTER"
+kubectl apply -f k8s/ingress.yaml --context "kind-$CLUSTER"
 
 # 5. Wait for rollout
 log "Waiting for rollout to complete..."

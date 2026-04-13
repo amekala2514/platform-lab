@@ -4,10 +4,20 @@ name: platform-lab
 
 nodes:
   - role: control-plane
-    # Expose port 80 and 443 on the host for future ingress use
+    # Label this node so nginx ingress knows where to schedule
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    # Map container ports to host ports for ingress traffic
     extraPortMappings:
-      - containerPort: 30080
-        hostPort: 8090
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
         protocol: TCP
   - role: worker
   - role: worker
