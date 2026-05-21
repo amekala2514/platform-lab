@@ -1,0 +1,102 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+  helm:
+    name: Helm lint values
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+
+      - name: Pull charts
+        run: |
+          mkdir -p /tmp/charts
+          helm pull prometheus-community/kube-prometheus-stack --version 77.1.0 --untar --untardir /tmp/charts
+          helm pull ingress-nginx/ingress-nginx --version 4.13.0 --untar --untardir /tmp/charts
+
+      - name: Lint kube-prometheus-stack with values
+        run: helm lint /tmp/charts/kube-prometheus-stack --values terraform/values/kube-prometheus-stack.yaml
+
+      - name: Lint ingress-nginx with values
+        run: helm lint /tmp/charts/ingress-nginx --values terraform/values/ingress-nginx.yaml
+
+  kubectl:
+    name: kubectl dry-run manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.31.0"
+
+      - name: Dry-run platform-api manifest
+        run: kubectl apply --dry-run=client -f k8s/platform-api.yaml
+
+  yaml-lint:
+    name: YAML syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate YAML files
+        run: |
+          python3 -c "
+          import yaml, sys, pathlib
+          errors = 0
+          for p in pathlib.Path('.').rglob('*.y*ml'):
+              if any(x in str(p) for x in ['.terraform/', 'node_modules/']):
+                  continue
+              try:
+                  list(yaml.safe_load_all(p.read_text()))
+                  print(f'ok  {p}')
+              except yaml.YAMLError as e:
+                  print(f'ERR {p}: {e}')
+                  errors += 1
+          sys.exit(errors)
+          "
