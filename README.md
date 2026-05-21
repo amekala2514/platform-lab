@@ -2,6 +2,8 @@
 
 A reproducible local Kubernetes platform built with **Terraform**, **Helm**, and a Go microservice — instrumented end-to-end with Prometheus and Grafana.
 
+[![validate](https://github.com/amekala2514/platform-lab/actions/workflows/validate.yml/badge.svg)](https://github.com/amekala2514/platform-lab/actions/workflows/validate.yml)
+
 [![Terraform](https://img.shields.io/badge/Terraform-1.6%2B-7B42BC?logo=terraform)](https://www.terraform.io/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.35-326CE5?logo=kubernetes)](https://kubernetes.io/)
 [![Helm](https://img.shields.io/badge/Helm-3-0F1689?logo=helm)](https://helm.sh/)
