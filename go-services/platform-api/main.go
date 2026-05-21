@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type HealthResponse struct {
@@ -33,6 +35,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/info", infoHandler)
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/", rootHandler)
 
 	addr := fmt.Sprintf(":%s", port)
@@ -40,7 +43,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      loggingMiddleware(mux),
+		Handler:      instrumentingMiddleware(loggingMiddleware(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -62,7 +65,6 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	// Extend this to check downstream dependencies (DB, cache, etc.)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
