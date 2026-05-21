@@ -29,3 +29,10 @@ go-services/**/platform-api
 
 # kind cluster info (generated)
 terraform/environments/local/cluster-info.txt
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/tfplan
+terraform/*.tfvars
