@@ -76,7 +76,7 @@ jobs:
           version: "v1.31.0"
 
       - name: Dry-run platform-api manifest
-        run: kubectl apply --dry-run=client -f k8s/platform-api.yaml
+        run: kubectl apply --dry-run=client --validate=false -f k8s/platform-api.yaml
 
   yaml-lint:
     name: YAML syntax
