@@ -13,6 +13,7 @@ Build a reproducible local Kubernetes platform that demonstrates the patterns I'
 - A Go service instrumented with Prometheus metrics
 - Hostname-based ingress routing that mirrors how production traffic flows
 - CI gates on every change
+- GitOps for workloads (added in v0.2)
 
 ---
 
@@ -312,6 +313,152 @@ This makes infrastructure review work the same as code review: read the diff, th
 
 ---
 
+## Phase 8 — GitOps with Argo CD (v0.2 Phase A)
+
+### Decision: Argo CD over Flux
+
+Both are CNCF-graduated GitOps controllers. Argo CD won on:
+
+- **UI included.** Flux is CLI-only; Argo CD ships a usable web UI. For a homelab where I'll routinely poke at sync status, that matters.
+- **Application abstraction.** Argo's `Application` CR is a single object that fully describes "what + where", which composes well with the app-of-apps pattern.
+- **Larger ecosystem.** ApplicationSets, ArgoCD Image Updater, Argo Rollouts — all in the same family with shared concepts.
+
+Flux remains the right pick for environments that prize lower runtime footprint and fully-imperative-free workflows. Not this homelab.
+
+### Decision: separate gitops repo (platform-lab-gitops) over monorepo
+
+Two-repo split:
+
+| Repo | Owns | Tooling |
+|---|---|---|
+| `platform-lab` | Cluster + Helm releases + Argo CD itself + infrastructure ingresses | Terraform |
+| `platform-lab-gitops` | Workload manifests (Deployment, Service, Ingress, ServiceMonitor) | Argo CD |
+
+Reasons:
+- **Blast-radius separation.** A bad Terraform change can't break workloads; a bad workload commit can't break the platform.
+- **Permissions story.** In a real org, infra and app teams have different write access. Two repos make that easy; a monorepo needs CODEOWNERS gymnastics.
+- **Argo CD source-of-truth is narrow.** It only watches the gitops repo, not the whole platform-lab repo. Faster reconcile loops, cleaner audit trail.
+
+Stretch goal for v0.3: make the gitops repo private and use sealed-secrets / external-secrets for credential management.
+
+### Decision: app-of-apps pattern with `directory: { recurse: true }`
+
+Terraform creates exactly one `Application` CR — the `root` app — pointing at the gitops repo's `apps/` directory. The root app discovers all child Applications under that directory.
+
+```yaml
+spec:
+  source:
+    repoURL: https://github.com/amekala2514/platform-lab-gitops.git
+    path: apps
+    directory:
+      recurse: true
+```
+
+Adding a new workload now means:
+1. Drop manifests in `workloads/<name>/`
+2. Drop an `Application` CR in `apps/<name>.yaml`
+3. `git push`
+
+No Terraform changes, no new helm releases, no operator restarts. The root app picks up the new child within ~3 minutes (or instantly with `kubectl -n argocd patch app root --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'`).
+
+### Problem 9: Argo CD `Application` CRD not registered at plan time
+
+**Symptom:** `terraform apply` failed during plan with:
+
+```
+Error: API did not recognize GroupVersionKind from manifest (CRD may not be installed)
+  with kubernetes_manifest.root_app,
+  on argocd.tf line 90, in resource "kubernetes_manifest" "root_app":
+no matches for kind "Application" in group "argoproj.io"
+```
+
+**Root cause:** Same family of bug as Problem 6 (cold start `kubernetes_manifest` plan), but now triggered by Argo CD CRDs specifically. Plan validates `Application` against the live API server's CRD list. If `helm_release.argocd` hasn't applied yet, the CRD isn't there, and plan fails.
+
+**Fix:** Targeted apply for the helm release first, then a normal apply for the manifest:
+
+```bash
+terraform apply -target=helm_release.argocd -target=kubernetes_manifest.argocd_ingress
+terraform apply
+```
+
+**Lesson:** Any time you add a new CRD-introducing helm release that's followed by `kubernetes_manifest` resources of that CRD's kinds, you'll hit this. The two-phase pattern from Phase 6 is the permanent answer.
+
+### Problem 10: bcrypt drift on every `terraform plan`
+
+**Symptom:** After installing Argo CD, every subsequent `terraform plan` showed the helm release as "will be updated in-place" even though no inputs had changed.
+
+**Root cause:** I was computing the admin password's bcrypt hash inline:
+
+```hcl
+set {
+  name  = "configs.secret.argocdServerAdminPassword"
+  value = bcrypt(var.argocd_admin_password, 10)
+}
+```
+
+`bcrypt()` is non-deterministic — same plaintext input produces a different hash every time, by design (the salt is randomized). Plan re-evaluated the function every run, saw a different hash, and reported drift.
+
+**Fix:** `lifecycle.ignore_changes = [set]` on the `helm_release.argocd` resource. The actual password value is fixed, and `set` blocks include the password — telling Terraform to ignore changes to them stops the spurious diff.
+
+```hcl
+resource "helm_release" "argocd" {
+  # ...
+  set { name = "configs.secret.argocdServerAdminPassword"; value = bcrypt(var.argocd_admin_password, 10) }
+  set { name = "configs.secret.argocdServerAdminPasswordMtime"; value = "2026-05-21T00:00:00Z" }
+  lifecycle { ignore_changes = [set] }
+}
+```
+
+**Lesson:** Any non-deterministic function in Terraform inputs (`bcrypt`, `uuid`, `timestamp`) is a drift trap. Either compute the value once and store it as input, or use `ignore_changes` on the field that holds it.
+
+### Problem 11: cat heredoc silently dropped a Terraform file
+
+**Symptom:** Wrote four new files via `cat > FILE <<'EOF'` blocks. Three landed; one (`argocd.tf`) didn't, and I didn't notice until `terraform plan` reported no changes.
+
+**Root cause:** A multi-line `cat` heredoc pasted into a terminal session can be interrupted mid-paste — usually by an unbalanced quote or a pasted comment that the shell interprets as the start of a new command. The heredoc never closes, the shell stays in heredoc mode silently, and the file never gets written.
+
+**Detection:**
+
+```bash
+ls -la /Users/ashish/Desktop/platform-lab/terraform/argocd.tf
+# ls: argocd.tf: No such file or directory
+```
+
+**Fix:** Re-pasted the single failed heredoc, this time wrapping the entire block in a single fenced clipboard copy without inline comments. Verified file size > 0 immediately after.
+
+**Lesson:** When pasting heredocs, paste each one separately, and `ls -la` the file right after. Multi-block paste is a known footgun on zsh/bash with TTY paste-bracketing disabled.
+
+### Decision: cluster-side adoption via `ServerSideApply`
+
+When migrating platform-api from Terraform-managed to Argo-CD-managed, the resources already existed in the cluster (created originally by `kubectl apply -f k8s/platform-api.yaml` in v0.1). I needed Argo CD to "adopt" them rather than fight them.
+
+Both Application CRs use:
+
+```yaml
+syncOptions:
+  - ServerSideApply=true
+  - ApplyOutOfSyncOnly=true
+```
+
+Server-side apply makes Argo CD a co-owner via field manager `argocd-controller`, which lets the existing resources stay in place but progressively migrate ownership of fields as they're touched. There was a single rolling restart of the platform-api Deployment when sync started (the manifests had minor differences from what was in the cluster — different `imagePullPolicy` defaults from `kubectl apply`'s client-side merge), but no downtime: both replicas rolled cleanly.
+
+**Lesson:** Adopting existing resources into GitOps without a service interruption is a solved problem if you use server-side apply from day one. Client-side apply leaves brittle annotations (`kubectl.kubernetes.io/last-applied-configuration`) that force resource recreation when ownership changes.
+
+### Decision: `terraform state rm` for handoff, not destroy
+
+To complete the migration, Terraform needed to stop claiming ownership of the platform-api Ingress and ServiceMonitor — without deleting them from the cluster (Argo CD owns them now).
+
+```bash
+terraform state rm kubernetes_manifest.platform_api_ingress
+terraform state rm kubernetes_manifest.platform_api_servicemonitor
+```
+
+`state rm` removes the resource from Terraform's state file but leaves the live cluster object untouched. Then I deleted `platform-api.tf` (renamed to `ingresses.tf` for what remained — the infra ingresses for Grafana/Prometheus/Alertmanager). A final `terraform plan` showed "No changes", confirming the handoff was clean.
+
+**Lesson:** The right way to migrate ownership of cluster resources from one IaC tool to another is to remove them from the source state without applying, then let the destination tool reconcile. Never `terraform destroy` first; that rips down the cluster object before anyone else can adopt it.
+
+---
+
 ## Summary of architectural decisions
 
 | Area | Decision | Rationale |
@@ -324,6 +471,10 @@ This makes infrastructure review work the same as code review: read the diff, th
 | IaC | Terraform with two-phase apply | Needed for cluster + manifest cohabitation |
 | Manifest validation | kubeconform in CI | Offline, no cluster required |
 | Dashboard provisioning | ConfigMap with sidecar label | First-class object, version-controlled |
+| GitOps controller | Argo CD | UI included, app-of-apps pattern, broad ecosystem |
+| Repo split | `platform-lab` (infra) + `platform-lab-gitops` (workloads) | Blast-radius separation, clean permissions story |
+| Workload migration | Server-side apply + `terraform state rm` | Adopt without recreating; no downtime |
+| Argo bcrypt drift | `lifecycle.ignore_changes = [set]` | Non-deterministic functions force drift otherwise |
 
 ---
 
@@ -333,14 +484,14 @@ This makes infrastructure review work the same as code review: read the diff, th
 - **Build the dashboard JSON last, not first.** I iterated on PromQL queries against an empty target for an hour before realizing the ServiceMonitor wasn't being picked up. Validate the scrape pipeline end-to-end before touching the dashboard.
 - **Add the `Makefile` earlier.** Twelve copy-pasted command blocks across a session is a sign you need a Makefile. Adding it on day three felt overdue.
 - **Run `terraform fmt` as a pre-commit hook from the start.** I had to fix formatting after writing the validate workflow because my files weren't formatted.
+- **Verify file existence after every cat heredoc.** Lost 10 minutes to a silent drop.
 
 ---
 
 ## Open work
 
-- `docs/ARCHITECTURE.md` — diagram and component data flow
-- `docs/GETTING_STARTED.md` — copy/paste onboarding for someone else
+- Local AI inference platform (v0.2 Phases B–D)
 - Alertmanager → Slack webhook + meaningful PrometheusRules
-- GitOps with Argo CD
 - Distributed tracing with OpenTelemetry + Grafana Tempo
-- v0.1.0 release tag with proper release notes
+- Integration test workflow that provisions the cluster in GitHub Actions
+- Private gitops repo + sealed-secrets / external-secrets
