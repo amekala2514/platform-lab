@@ -36,3 +36,16 @@ terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/tfplan
 terraform/*.tfvars
+
+# Terraform local state + backups
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform/
+terraform/.terraform.lock.hcl.bak
+
+# Kubeconfig (cluster certs)
+terraform/platform-lab-config
+terraform/kubeconfig*
+
+# Plan output
+terraform/tfplan
