@@ -64,19 +64,25 @@ jobs:
       - name: Lint ingress-nginx with values
         run: helm lint /tmp/charts/ingress-nginx --values terraform/values/ingress-nginx.yaml
 
-  kubectl:
-    name: kubectl dry-run manifests
+  kubeconform:
+    name: kubeconform manifest validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "v1.31.0"
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+          kubeconform -v
 
-      - name: Dry-run platform-api manifest
-        run: kubectl apply --dry-run=client --validate=false -f k8s/platform-api.yaml
+      - name: Validate k8s manifests
+        run: |
+          kubeconform \
+            -strict \
+            -summary \
+            -kubernetes-version 1.31.0 \
+            k8s/
 
   yaml-lint:
     name: YAML syntax
