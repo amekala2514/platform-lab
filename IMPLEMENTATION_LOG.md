@@ -495,3 +495,112 @@ terraform state rm kubernetes_manifest.platform_api_servicemonitor
 - Distributed tracing with OpenTelemetry + Grafana Tempo
 - Integration test workflow that provisions the cluster in GitHub Actions
 - Private gitops repo + sealed-secrets / external-secrets
+## Phase 9 — Ollama Plumbing (v0.2 Phase B)
+
+**Goal:** Wire the cluster to a host-native Ollama on the Mac Studio so workloads inside Kubernetes can call LLM inference without running models in pods (Metal acceleration stays on macOS).
+
+### Design decisions
+
+1. **Inference stays outside the cluster.** Ollama runs natively on macOS to keep Metal/GPU acceleration. No GPU passthrough into Docker Desktop, no model weights in pods.
+2. **Coexistence with existing Ollama project.** A second project on this Mac already uses Ollama on `127.0.0.1:11434`. Rather than running a second instance on a different port, we expanded the bind from `127.0.0.1` to `0.0.0.0` — the existing project continues to hit `localhost` unchanged (non-breaking), and Docker/cluster traffic now reaches it via `host.docker.internal`.
+3. **ExternalName Service, not Endpoints + headless Service.** Cleaner: one YAML, no IP to babysit, and `host.docker.internal` is the canonical Docker-for-Mac bridge alias.
+4. **GitOps-managed.** The `inference` namespace and the `ollama` Service live in the gitops repo, applied by Argo CD via the `inference` Application (app-of-apps child).
+
+### Implementation
+
+**Mac side — Ollama bind change:**
+
+```bash
+# Set env var for current session + future launchctl-spawned processes
+launchctl setenv OLLAMA_HOST 0.0.0.0:11434
+
+# Restart Ollama so it picks up the new bind
+pkill -x Ollama && open -a Ollama
+
+# Verify
+lsof -nP -iTCP:11434 -sTCP:LISTEN
+# → ollama ... TCP *:11434 (LISTEN)
+```
+
+LaunchAgent (`~/Library/LaunchAgents/com.ollama.host.plist`) was prepared for persistence across reboots — sets `OLLAMA_HOST=0.0.0.0:11434` in the user session environment before Ollama launches.
+
+**Cluster side — gitops repo additions:**
+
+```
+workloads/inference/
+├── namespace.yaml         # inference namespace
+└── ollama-service.yaml    # ExternalName → host.docker.internal:11434
+```
+
+```yaml
+# ollama-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: inference
+spec:
+  type: ExternalName
+  externalName: host.docker.internal
+  ports:
+    - port: 11434
+      targetPort: 11434
+      protocol: TCP
+```
+
+Plus `apps/inference.yaml` (Argo Application pointing at `workloads/inference`).
+
+### Smoke tests (all from inside the cluster)
+
+```bash
+# 1. Version — proves DNS + ExternalName + network path
+kubectl -n inference run curl-test --rm -i --restart=Never \
+  --image=curlimages/curl:latest -- -s http://ollama:11434/api/version
+# → {"version":"0.24.0"}
+
+# 2. Generate — proves end-to-end inference
+kubectl -n inference run curl-gen --rm -i --restart=Never \
+  --image=curlimages/curl:latest -- -s -X POST \
+  http://ollama:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5:7b-instruct","prompt":"Say hi in exactly 5 words","stream":false}'
+# → {"response":"Hello, nice to meet you.", "eval_count":8, "eval_duration":113874501, ...}
+
+# 3. Tags — confirms all 6 host models visible
+kubectl -n inference run curl-tags --rm -i --restart=Never \
+  --image=curlimages/curl:latest -- -s http://ollama:11434/api/tags
+# → qwen2.5:7b-instruct, llava, deepseek-coder-v2:16b, nomic-embed-text,
+#    qwen2.5-coder:14b, llama3.1:8b
+```
+
+### Performance baseline (qwen2.5:7b-instruct, Metal, cold start)
+
+| Metric              | Value          |
+|---------------------|----------------|
+| Total round-trip    | 1.58 s         |
+| Model load          | 1.14 s (cold)  |
+| Prompt eval         | 317 ms (36 tok)|
+| Generation          | 114 ms (8 tok) |
+| Throughput          | ~70 tok/s      |
+
+Warm calls (model resident) should drop total round-trip to <200 ms for short completions.
+
+### Problem 12 — `OLLAMA_HOST` env var is consumed by both client and server
+
+Setting `OLLAMA_HOST` at shell scope affects the `ollama` CLI too — running `ollama list` later tries to hit `0.0.0.0:11434` from the client side. Workaround: the CLI happily talks to that address since the server is bound there. No action needed, but worth noting for anyone wondering why `ollama list` keeps working unchanged.
+
+### Problem 13 — `osascript` "User canceled" on automation prompt
+
+First attempt to restart Ollama via AppleScript triggered a macOS automation permission dialog that was dismissed. Used `pkill -x Ollama && open -a Ollama` instead — bypasses the AppleScript permissions layer entirely.
+
+### What's now reachable from cluster pods
+
+| Service DNS                  | Target                        | Use case            |
+|------------------------------|-------------------------------|---------------------|
+| `ollama.inference:11434`     | `host.docker.internal:11434`  | All LLM inference   |
+
+### Next (Phase C)
+
+- Custom Go `inference-gateway` Deployment (OpenAI-compatible API in front of Ollama, exporting Prometheus metrics: TTFT, tokens/sec, active requests, error rate)
+- Open WebUI Deployment + Ingress at `chat.platform-lab.test`
+- Grafana dashboard: "LLM Inference" panel — request rate, p50/p95 latency, tokens/sec, error rate
