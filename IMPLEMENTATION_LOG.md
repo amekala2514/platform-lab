@@ -604,3 +604,75 @@ First attempt to restart Ollama via AppleScript triggered a macOS automation per
 - Custom Go `inference-gateway` Deployment (OpenAI-compatible API in front of Ollama, exporting Prometheus metrics: TTFT, tokens/sec, active requests, error rate)
 - Open WebUI Deployment + Ingress at `chat.platform-lab.test`
 - Grafana dashboard: "LLM Inference" panel — request rate, p50/p95 latency, tokens/sec, error rate
+
+## Phase C — Inference Layer (v0.2.0)
+
+### Goals
+
+1. Stand up an OpenAI-compatible inference gateway in Go fronting local Ollama
+2. Deploy Open WebUI as an authenticated chat client backed by the gateway
+3. Build a Grafana dashboard for LLM-specific signals (TTFT, latency, tokens)
+4. Tag a clean v0.2.0 release across all three repos
+
+### C.0 — Pre-flight (post 3-week pause)
+
+Resumed work after holiday break. Found:
+- kubeconfig stale (port 57486 refused) — `kind export kubeconfig --name platform-lab` fixed
+- Ollama bound only to `127.0.0.1` — relaxed to `*:11434` and installed a LaunchAgent to persist (`~/Library/LaunchAgents/com.ollama.host.plist`)
+- `inference` Argo app was OutOfSync flapping (autoHealAttemptsCount=1731) — controller was normalizing `directory.recurse: false` to `true` on every poll. Fixed by removing the `directory:` block entirely from `apps/inference.yaml` (commit `de2c3ee`).
+
+### C.1 — Inference gateway
+
+Built incrementally, each step landing in `~/Desktop/inference-gateway`:
+
+| Sub-step | Commit  | What landed                                                       |
+|----------|---------|-------------------------------------------------------------------|
+| C.1.a    | `fe0bf60` | chi router skeleton, config, healthz                              |
+| C.1.b    | `cd9bf63` | Ollama passthrough (chat, models, embeddings)                     |
+| C.1.c    | `ac53e48` | SSE streaming for `stream:true` chat requests                     |
+| C.1.d    | `831b762` | Prometheus metrics (TTFT, latency, tokens, active, errors)        |
+| C.1.e    | `e2a7604` | Multi-stage Dockerfile (golang:1.26-alpine → distroless), Makefile|
+| —        | `a7cf609` | Renamed `endpoint` Prom label to `path` to dodge SM port-name clash |
+
+**Stale-process gotcha**: every time we re-tested locally, the previous `go run` still held port 8080. Standard kill block became part of the dev workflow:
+```bash
+lsof -nP -iTCP:8080 -sTCP:LISTEN -t | xargs kill 2>/dev/null; sleep 1
+```
+
+**Docker on Mac gotcha**: build initially failed with `docker-credential-desktop: executable file not found`. Fix: added `/Applications/Docker.app/Contents/Resources/bin` to PATH in `~/.zshrc`.
+
+**Go version**: local was 1.26.2, base image was `golang:1.22-alpine`. Bumped Dockerfile to `golang:1.26-alpine`.
+
+### C.1.f-g — GitOps manifests + smoke tests
+
+Argo Application + Deployment + Service + Ingress + ServiceMonitor under `workloads/inference-gateway/`. First pod hit `CreateContainerConfigError` — distroless's `nonroot` user is non-numeric, so kubelet's `runAsNonRoot: true` check couldn't verify it. Fixed by explicitly setting `runAsUser: 65532`, `runAsGroup: 65532`, `fsGroup: 65532`.
+
+Smoke test results:
+- Inside-cluster curl to all 4 endpoints (`/healthz`, `/v1/models`, `/v1/chat/completions` stream + non-stream, `/v1/embeddings`) — all green
+- SSE worked through nginx ingress thanks to `nginx.ingress.kubernetes.io/proxy-buffering: off`
+- ServiceMonitor discovered via `release: kps` label; Prometheus scraped within 30s
+- Verified `gateway_build_info` and `sum(inference_requests_total)` in Prometheus
+
+### C.2 — Open WebUI
+
+Initial pod was OOMKilled at 1Gi limit — Open WebUI loads sentence-transformers on first boot. Bumped limit to 3Gi and switched RAG embedding engine to OpenAI mode pointing back at our gateway (`nomic-embed-text:latest`), which avoids the local model download entirely. `strategy: Recreate` because the data PVC is RWO.
+
+### C.3 — Grafana dashboard
+
+ConfigMap-based dashboard with 9 panels. kps Grafana sidecar config: watches `LABEL=grafana_dashboard`, `LABEL_VALUE=1`, across ALL namespaces. Folder annotation `grafana_folder: platform-lab` lands it in a dedicated folder.
+
+Followed up with a Grafana ingress (`grafana.platform-lab.test`) so we can stop port-forwarding.
+
+### C.4 — Cleanup & release
+
+- Tagged `inference-gateway` v0.2.0 on `a7cf609`
+- Rebuilt and kind-loaded the image with `VERSION=v0.2.0` (now `gateway_build_info{version="v0.2.0", commit="a7cf609"}`)
+- Updated gitops `deployment.yaml` to pin `image: inference-gateway:v0.2.0`
+- Tagged `platform-lab` and `platform-lab-gitops` repos as v0.2.0
+
+### Performance baselines
+
+Measured via gateway metrics on Apple Metal:
+- **qwen2.5:7b-instruct**: ~70 tok/s steady-state, p95 TTFT ~127ms after warm-up
+- **nomic-embed-text**: ~25ms total for 1-line input
+- **Non-stream chat round-trip**: ~450ms for short responses

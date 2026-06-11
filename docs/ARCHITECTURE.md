@@ -510,3 +510,53 @@ Four parallel jobs, all complete in ~60 seconds:
 | Integration test workflow | New `.github/workflows/integration-test.yml` that spins up Kind in CI |
 | Private gitops repo | Argo CD repo Secret with PAT or SSH deploy key; sealed-secrets for in-cluster credentials |
 | ApplicationSets for fleet management | When/if we add a second cluster |
+
+## Phase C — Inference Layer (v0.2.0)
+
+### inference-gateway
+
+A Go service implementing a subset of the OpenAI v1 API, translating requests to the locally-running Ollama daemon on the host.
+
+**Why a gateway and not just exposing Ollama directly?**
+
+1. **Stable API surface** — Open WebUI, LangChain, llama-index, OpenAI SDK all speak OpenAI v1. Ollama's native API is a moving target.
+2. **Observability** — first-class Prometheus metrics: TTFT, end-to-end latency (split by streaming vs non-streaming), token throughput by direction, active in-flight requests, requests by path and status. Ollama's own metrics are minimal.
+3. **Future-proofing** — a single chokepoint where we can later add rate limiting, per-user quotas, model routing, or fallback chains.
+
+**Endpoints**:
+- `GET /healthz` — liveness, always 200
+- `GET /readyz` — checks Ollama `/api/version` with 3s timeout
+- `GET /v1/models` — list available models
+- `POST /v1/chat/completions` — chat (streaming via SSE when `stream:true`, non-streaming otherwise)
+- `POST /v1/embeddings` — embeddings
+- `GET /metrics` — Prometheus exposition
+
+**Image**: distroless static (`gcr.io/distroless/static-debian12:nonroot`), runs as UID 65532, read-only root FS, ~5MB compressed.
+
+### Open WebUI
+
+Multi-user chat UI authenticated with email/password. Configured via env vars to:
+- talk to the gateway via `OPENAI_API_BASE_URL=http://inference-gateway.inference:8080/v1`
+- delegate RAG embeddings through the same gateway (`RAG_EMBEDDING_ENGINE=openai`, `RAG_EMBEDDING_MODEL=nomic-embed-text:latest`)
+- block direct Ollama API access (`ENABLE_OLLAMA_API=false`) so ALL traffic flows through the gateway for full metric coverage
+
+Data persisted in a 5Gi PVC (`open-webui-data`). Default user role is `pending` — first user becomes admin and approves subsequent signups.
+
+### Grafana dashboard
+
+`LLM Inference` dashboard in the `platform-lab` folder, provisioned via a ConfigMap with the `grafana_dashboard: "1"` label. Auto-discovered by the kps Grafana sidecar.
+
+Panels (9):
+1. Build Info (version + commit)
+2. Error Rate (5m)
+3. Active Requests (now)
+4. Request Rate by Path
+5. Token Throughput (prompt vs completion)
+6. TTFT (p50/p95/p99) by Model
+7. End-to-end Latency (p50/p95/p99) by model & stream
+8. Active Requests by Path (stacked, step interpolation)
+9. Top Models by Requests (1h)
+
+### Observability ingress
+
+Grafana exposed at `grafana.platform-lab.test` (Argo CD-managed Ingress targeting the Helm-managed `kps-grafana` service).
