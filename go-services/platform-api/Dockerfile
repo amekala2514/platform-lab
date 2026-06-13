@@ -1,19 +1,15 @@
-# Stage 1: Build
-FROM golang:1.24 AS build
-
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
-COPY go.mod ./
-# Download dependencies first (layer cache friendly)
+COPY go.mod go.sum ./
 RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/platform-api .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -ldflags="-s -w" -o /out/platform-api .
 
-# Stage 2: Minimal runtime image
-FROM gcr.io/distroless/base-debian12
-
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/platform-api /platform-api
-
+USER nonroot:nonroot
 EXPOSE 8080
-
 ENTRYPOINT ["/platform-api"]

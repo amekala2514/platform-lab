@@ -38,12 +38,15 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/", rootHandler)
 
+	pub := newKafkaPublisher()
+	defer pub.close()
+
 	addr := fmt.Sprintf(":%s", port)
 	log.Printf("platform-api starting on %s", addr)
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      instrumentingMiddleware(loggingMiddleware(mux)),
+		Handler:      kafkaMiddleware(pub, instrumentingMiddleware(loggingMiddleware(mux))),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
